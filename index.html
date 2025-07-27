@@ -1,3 +1,4 @@
+<!-- UPDATED HTML: Hybrid decoder based on ITTY DSP concepts integrated -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -11,51 +12,39 @@
   </style>
 </head>
 <body>
-
 <h2>Pocket Teletype - AFSK Baudot Terminal</h2>
-
-<!-- TX Section -->
 <textarea id="txText" placeholder="Enter text to transmit..."></textarea><br>
-<label>Mark Freq: <input id="markFreqInput" value="2125" type="number" step="1"></label>
-<label>Space Freq: <input id="spaceFreqInput" value="2295" type="number" step="1"></label>
-<label>Baud Rate: <input id="baudRateInput" value="45.45" type="number" step="0.01"></label><br>
+<label>Mark Freq: <input id="markFreqInput" value="2125" type="number"></label>
+<label>Space Freq: <input id="spaceFreqInput" value="2295" type="number"></label>
+<label>Baud Rate: <input id="baudRateInput" value="45.45" type="number"></label><br>
 <button onclick="startTransmit()">Transmit</button>
-
-<!-- RX Section -->
-<div style="text-align:center;">
+<div>
   <canvas id="micScope" width="600" height="100"></canvas>
-  <button id="toggleReceiveBtn" onclick="toggleReceive()">Start Receive</button>
-  <div id="status" style="margin-top: 0.5em; font-size: 1em; color: lime; height: 1.5em;"></div>
-  <label>Sensitivity Threshold:
-    <input type="number" id="thresholdRatioInput" value="2.0" step="0.1" style="width: 60px;">
-  </label>
+  <button onclick="toggleReceive()" id="toggleReceiveBtn">Start Receive</button>
+  <div id="status" style="color: lime; margin: 0.5em;"></div>
+  <label>Sensitivity: <input type="number" id="thresholdRatioInput" value="2.0" step="0.1"></label>
   <div style="margin-top: 0.5em;">
-    <span id="ledMark" style="display:inline-block;width:20px;height:20px;border-radius:50%;background:#333;margin:0 10px;"></span> Mark
-    <span id="ledSpace" style="display:inline-block;width:20px;height:20px;border-radius:50%;background:#333;margin:0 10px;"></span> Space
+    <span id="ledMark" style="width:20px;height:20px;border-radius:50%;background:#333;display:inline-block;margin:0 10px;"></span>Mark
+    <span id="ledSpace" style="width:20px;height:20px;border-radius:50%;background:#333;display:inline-block;margin:0 10px;"></span>Space
   </div>
 </div>
 <pre id="rxOutput"></pre>
-
 <script>
-let audioCtx = null;
-let processor = null;
-let source = null;
-let receiving = false;
-let ledTimeout = null;
-let txCtx = null;
-const MIN_ENERGY_THRESHOLD = 1e6;
+let audioCtx, processor, source, sampleBuffer = [];
+let collecting = false, bitBuffer = [], lastSampleTime = 0, baudInterval = 0;
+let decodeState = 'IDLE';
+const MIN_THRESHOLD = 0.05;
 
 function toggleReceive() {
-  if (!receiving) {
-    startReceive();
-    document.getElementById('toggleReceiveBtn').innerText = 'Stop Receive';
-    document.getElementById('status').innerText = 'Receiving...';
-  } else {
+  if (audioCtx) {
     stopReceive();
     document.getElementById('toggleReceiveBtn').innerText = 'Start Receive';
     document.getElementById('status').innerText = '';
+  } else {
+    startReceive();
+    document.getElementById('toggleReceiveBtn').innerText = 'Stop Receive';
+    document.getElementById('status').innerText = 'Receiving...';
   }
-  receiving = !receiving;
 }
 
 function startReceive() {
@@ -64,79 +53,61 @@ function startReceive() {
   const baud = parseFloat(document.getElementById('baudRateInput').value);
   const thresholdRatio = parseFloat(document.getElementById('thresholdRatioInput').value);
   const sampleRate = 44100;
-  const samplesPerBit = Math.floor(sampleRate / baud);
+  baudInterval = 1 / baud;
 
   navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     source = audioCtx.createMediaStreamSource(stream);
-    processor = audioCtx.createScriptProcessor(512, 1, 1);
-    const goertzelMark = new Goertzel(markFreq, sampleRate);
-    const goertzelSpace = new Goertzel(spaceFreq, sampleRate);
+    processor = audioCtx.createScriptProcessor(256, 1, 1);
 
-    let bitBuffer = [];
-    let samplesCollected = 0;
-
-    const canvas = document.getElementById('micScope');
-    const ctx = canvas.getContext('2d');
-    const scopeWidth = canvas.width;
-    const scopeHeight = canvas.height;
-
-    const ledMark = document.getElementById('ledMark');
-    const ledSpace = document.getElementById('ledSpace');
+    const markDetector = new Goertzel(markFreq, sampleRate);
+    const spaceDetector = new Goertzel(spaceFreq, sampleRate);
+    const scopeCanvas = document.getElementById("micScope");
+    const scopeCtx = scopeCanvas.getContext("2d");
 
     processor.onaudioprocess = e => {
       const samples = e.inputBuffer.getChannelData(0);
-      const energyMark = goertzelMark.run(samples);
-      const energySpace = goertzelSpace.run(samples);
+      for (let i = 0; i < samples.length; i++) sampleBuffer.push(samples[i]);
+
+      const energyMark = markDetector.run(samples);
+      const energySpace = spaceDetector.run(samples);
       const signalPower = Math.max(energyMark, energySpace);
 
-      let markActive = false;
-      let spaceActive = false;
+      const markLed = document.getElementById("ledMark");
+      const spaceLed = document.getElementById("ledSpace");
+      markLed.style.background = energyMark > energySpace ? 'lime' : '#333';
+      spaceLed.style.background = energySpace > energyMark ? 'red' : '#333';
 
-      if (signalPower > MIN_ENERGY_THRESHOLD) {
-        markActive = energyMark > energySpace * thresholdRatio;
-        spaceActive = energySpace > energyMark * thresholdRatio;
-      }
-
-      ledMark.style.background = markActive ? 'lime' : '#333';
-      ledSpace.style.background = spaceActive ? 'red' : '#333';
-
-      if (ledTimeout) clearTimeout(ledTimeout);
-      ledTimeout = setTimeout(() => {
-        ledMark.style.background = '#333';
-        ledSpace.style.background = '#333';
-      }, 100);
-
-      let bit = null;
-      if (markActive) bit = 1;
-      else if (spaceActive) bit = 0;
-
-      if (bit !== null) {
-        samplesCollected += samples.length;
-        if (samplesCollected >= samplesPerBit) {
-          samplesCollected = 0;
-          bitBuffer.push(bit);
-
-          if (bitBuffer.length === 8) {
-            if (bitBuffer[0] === 0 && bitBuffer[6] === 1 && bitBuffer[7] === 1) {
+      // Decode every baud interval using windowed signal power
+      const now = audioCtx.currentTime;
+      if (now - lastSampleTime >= baudInterval) {
+        lastSampleTime = now;
+        if (signalPower > MIN_THRESHOLD) {
+          const bit = energyMark > energySpace * thresholdRatio ? 1 : 0;
+          if (decodeState === 'IDLE' && bit === 0) {
+            decodeState = 'START';
+            bitBuffer = [0];
+          } else if (decodeState === 'START') {
+            bitBuffer.push(bit);
+            if (bitBuffer.length === 8) {
+              decodeState = 'IDLE';
               decodeBaudot(bitBuffer);
             }
-            bitBuffer = [];
           }
         }
       }
 
-      ctx.clearRect(0, 0, scopeWidth, scopeHeight);
-      ctx.beginPath();
-      ctx.strokeStyle = 'lime';
-      for (let i = 0; i < scopeWidth; i++) {
-        const idx = Math.floor(i * samples.length / scopeWidth);
-        const y = (0.5 - samples[idx] / 2) * scopeHeight;
-        ctx.lineTo(i, y);
+      // Draw waveform
+      scopeCtx.clearRect(0, 0, scopeCanvas.width, scopeCanvas.height);
+      scopeCtx.beginPath();
+      scopeCtx.strokeStyle = 'lime';
+      for (let i = 0; i < scopeCanvas.width; i++) {
+        const idx = Math.floor(i * samples.length / scopeCanvas.width);
+        const y = (0.5 - samples[idx] / 2) * scopeCanvas.height;
+        scopeCtx.lineTo(i, y);
       }
-      ctx.stroke();
+      scopeCtx.stroke();
     };
-
     source.connect(processor);
     processor.connect(audioCtx.destination);
   });
@@ -146,62 +117,40 @@ function stopReceive() {
   if (processor) processor.disconnect();
   if (source) source.disconnect();
   if (audioCtx) audioCtx.close();
-  processor = null;
-  source = null;
-  audioCtx = null;
+  audioCtx = processor = source = null;
   document.getElementById('ledMark').style.background = '#333';
   document.getElementById('ledSpace').style.background = '#333';
-  if (ledTimeout) clearTimeout(ledTimeout);
 }
 
 function decodeBaudot(bits) {
-  const LETTERS = [ '', 'E', '\n', 'A', ' ', 'S', 'I', 'U',
-    '\r', 'D', 'R', 'J', 'N', 'F', 'C', 'K',
-    'T', 'Z', 'L', 'W', 'H', 'Y', 'P', 'Q',
-    'O', 'B', 'G', '', 'M', 'X', 'V' ];
-
-  const FIGURES = [ '', '3', '\n', '-', ' ', '\'', '8', '7',
-    '\r', '$', '4', '\'', ',', '!', ':', '(',
-    '5', '"', ')', '2', '#', '6', '0', '1',
-    '9', '?', '&', '', '.', '/', ';' ];
-
-  const LTRS = 0x1F;
-  const FIGS = 0x1B;
-
+  const LTRS = 0x1F, FIGS = 0x1B;
+  const LETTERS = ['', 'E', '\n', 'A', ' ', 'S', 'I', 'U', '\r', 'D', 'R', 'J', 'N', 'F', 'C', 'K',
+                   'T', 'Z', 'L', 'W', 'H', 'Y', 'P', 'Q', 'O', 'B', 'G', '', 'M', 'X', 'V'];
+  const FIGURES = ['', '3', '\n', '-', ' ', '\'', '8', '7', '\r', '$', '4', '\'', ',', '!', ':', '(',
+                   '5', '"', ')', '2', '#', '6', '0', '1', '9', '?', '&', '', '.', '/', ';'];
   const value = bits.slice(1, 6).reduce((acc, b, i) => acc | (b << i), 0);
-
   if (typeof decodeBaudot.shift === 'undefined') decodeBaudot.shift = 'LTRS';
-
-  if (value === LTRS) {
-    decodeBaudot.shift = 'LTRS';
-    return;
-  } else if (value === FIGS) {
-    decodeBaudot.shift = 'FIGS';
-    return;
-  }
-
+  if (value === LTRS) { decodeBaudot.shift = 'LTRS'; return; }
+  if (value === FIGS) { decodeBaudot.shift = 'FIGS'; return; }
   const table = decodeBaudot.shift === 'FIGS' ? FIGURES : LETTERS;
-  let char = table[value] || '?';
-  document.getElementById("rxOutput").textContent += char;
+  document.getElementById("rxOutput").textContent += table[value] || '?';
 }
 
 class Goertzel {
   constructor(freq, sampleRate) {
-    this.N = 512;
-    this.k = Math.round(0.5 + ((this.N * freq) / sampleRate));
-    this.omega = (2 * Math.PI * this.k) / this.N;
+    this.N = 256;
+    this.k = Math.round(this.N * freq / sampleRate);
+    this.omega = 2 * Math.PI * this.k / this.N;
     this.coeff = 2 * Math.cos(this.omega);
-    this.s_prev = 0;
-    this.s_prev2 = 0;
   }
   run(samples) {
-    this.s_prev = this.s_prev2 = 0;
+    let s_prev = 0, s_prev2 = 0;
     for (let i = 0; i < samples.length; i++) {
-      let s = samples[i] + this.coeff * this.s_prev - this.s_prev2;
-      this.s_prev2 = this.s_prev;
-      this.s_prev = s;
+      let s = samples[i] + this.coeff * s_prev - s_prev2;
+      s_prev2 = s_prev;
+      s_prev = s;
     }
-    return this.s_prev2 ** 2 + this.s_prev ** 2 - this.coeff * this.s_prev * this.s_prev2;
+    return s_prev2 ** 2 + s_prev ** 2 - this.coeff * s_prev * s_prev2;
   }
 }
 </script>
