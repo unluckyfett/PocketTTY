@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Pocket Teletype</title>
+  <style>
+    body {
+      background: #222;
+      color: #eee;
+      font-family: monospace;
+      text-align: center;
+      padding: 1em;
+    }
+    input, button {
+      font-size: 1em;
+      padding: 0.5em;
+      margin: 0.5em;
+    }
+    canvas {
+      margin: 1em auto;
+      display: block;
+    }
+    #waveform, #micScope {
+      background: #000;
+      width: 100%;
+      height: 100px;
+      border: 1px solid #444;
+    }
+    #terminal {
+      background: #111;
+      padding: 1em;
+      text-align: left;
+      max-height: 200px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <h1>Pocket Teletype</h1>
+  <input type="text" id="textInput" placeholder="Enter text" />
+  <button onclick="transmit()">Transmit</button>
+  <button onclick="startReceive()">Start Receive</button><br />
+  <label>Baud Rate: <input type="number" id="baudRateInput" value="45.45" step="0.01"></label>
+  <label>Mark Freq: <input type="number" id="markFreqInput" value="2125"></label>
+  <label>Space Freq: <input type="number" id="spaceFreqInput" value="2295"></label>
+
+  <canvas id="waveform"></canvas>
+  <canvas id="micScope" width="600" height="100"></canvas>
+
+  <h3>Terminal view</h3>
+  <div id="terminal"></div>
+
+  <script>
+    let shiftState = 'LTRS';
+    const SHIFT_LETTERS = 0b11011;
+    const SHIFT_FIGURES = 0b11111;
+
+    const baudotLetters = {
+      0b00011: 'A', 0b11001: 'B', 0b01110: 'C', 0b01001: 'D', 0b00001: 'E',
+      0b01101: 'F', 0b11010: 'G', 0b10100: 'H', 0b00110: 'I', 0b01011: 'J',
+      0b01111: 'K', 0b10010: 'L', 0b11100: 'M', 0b01100: 'N', 0b11000: 'O',
+      0b10110: 'P', 0b10111: 'Q', 0b01010: 'R', 0b00101: 'S', 0b10000: 'T',
+      0b00111: 'U', 0b11110: 'V', 0b10011: 'W', 0b11101: 'X', 0b10101: 'Y', 0b10001: 'Z',
+      0b00100: ' '
+    };
+
+    const baudotFigures = {
+      0b00011: '1', 0b11001: '?', 0b01110: ':', 0b01001: '3', 0b00001: 'E',
+      0b01101: '!', 0b11010: '&', 0b10100: '#', 0b00110: '8', 0b01011: "'",
+      0b01111: '(', 0b10010: ')', 0b11100: '.', 0b01100: ',', 0b11000: '9',
+      0b10110: '0', 0b10111: '1', 0b01010: '4', 0b00101: '/', 0b10000: '5',
+      0b00111: '7', 0b11110: ';', 0b10011: '2', 0b11101: '+', 0b10101: '6', 0b10001: '-',
+      0b00100: ' '
+    };
+
+    function decodeBaudot(bits) {
+      if (bits.length !== 8 || bits[0] !== 0 || bits[6] !== 1) return;
+      let value = 0;
+      for (let i = 0; i < 5; i++) value |= (bits[i + 1] << i);
+      if (value === SHIFT_LETTERS) { shiftState = 'LTRS'; return; }
+      if (value === SHIFT_FIGURES) { shiftState = 'FIGS'; return; }
+      const char = shiftState === 'LTRS' ? baudotLetters[value] || '?' : baudotFigures[value] || '?';
+      document.getElementById('terminal').innerText += char;
+    }
+
+    function baudotEncode(text) {
+      const mapLTRS = {}, mapFIGS = {};
+      for (const [k, v] of Object.entries(baudotLetters)) mapLTRS[v] = parseInt(k);
+      for (const [k, v] of Object.entries(baudotFigures)) mapFIGS[v] = parseInt(k);
+      let result = [], shift = 'LTRS';
+      for (let ch of text.toUpperCase()) {
+        let code = mapLTRS[ch];
+        if (code !== undefined) {
+          if (shift !== 'LTRS') { result.push(SHIFT_LETTERS); shift = 'LTRS'; }
+          result.push(code);
+        } else {
+          code = mapFIGS[ch];
+          if (code !== undefined) {
+            if (shift !== 'FIGS') { result.push(SHIFT_FIGURES); shift = 'FIGS'; }
+            result.push(code);
+          } else {
+            result.push(mapLTRS[' '] ?? 0b00100);
+          }
+        }
+      }
+      return result;
+    }
+
+    function bitstream(baudot) {
+      let bits = [];
+      for (let b of baudot) {
+        bits.push(0);
+        for (let i = 0; i < 5; i++) bits.push((b >> i) & 1);
+        bits.push(1, 1);
+      }
+      return bits;
+    }
+
+    function generateAFSK(bits) {
+      const markFreq = parseFloat(document.getElementById('markFreqInput').value);
+      const spaceFreq = parseFloat(document.getElementById('spaceFreqInput').value);
+      const baud = parseFloat(document.getElementById('baudRateInput').value);
+      const sampleRate = 44100;
+      const samplesPerBit = Math.floor(sampleRate / baud);
+      const ctx = new AudioContext();
+      const buffer = ctx.createBuffer(1, bits.length * samplesPerBit, sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < bits.length; i++) {
+        const freq = bits[i] ? markFreq : spaceFreq;
+        for (let j = 0; j < samplesPerBit; j++) {
+          const idx = i * samplesPerBit + j;
+          data[idx] = Math.sin(2 * Math.PI * freq * j / sampleRate);
+        }
+      }
+      return { ctx, buffer };
+    }
+
+    function transmit() {
+      const text = document.getElementById('textInput').value;
+      const encoded = baudotEncode(text);
+      const bits = bitstream(encoded);
+      const { ctx, buffer } = generateAFSK(bits);
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+      src.start();
+      drawWave(buffer.getChannelData(0));
+      document.getElementById('terminal').innerText += `\n${text.toUpperCase()}`;
+    }
+
+    function drawWave(data) {
+      const canvas = document.getElementById('waveform');
+      const ctx = canvas.getContext('2d');
+      canvas.width = canvas.clientWidth;
+      canvas.height = canvas.clientHeight;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.beginPath();
+      ctx.strokeStyle = 'cyan';
+      let step = Math.floor(data.length / canvas.width);
+      for (let i = 0; i < canvas.width; i++) {
+        let y = data[i * step] * canvas.height / 2 + canvas.height / 2;
+        ctx.lineTo(i, y);
+      }
+      ctx.stroke();
+    }
+
+    function startReceive() {
+      const markFreq = parseFloat(document.getElementById('markFreqInput').value);
+      const spaceFreq = parseFloat(document.getElementById('spaceFreqInput').value);
+      const baud = parseFloat(document.getElementById('baudRateInput').value);
+      const sampleRate = 44100;
+      const samplesPerBit = Math.floor(sampleRate / baud);
+
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+        const audioCtx = new AudioContext();
+        const source = audioCtx.createMediaStreamSource(stream);
+        const processor = audioCtx.createScriptProcessor(1024, 1, 1);
+        const goertzelMark = new Goertzel(markFreq, sampleRate);
+        const goertzelSpace = new Goertzel(spaceFreq, sampleRate);
+        let bitBuffer = [], bitTimer = 0;
+
+        const scope = document.getElementById('micScope');
+        const ctx = scope.getContext('2d');
+        const W = scope.width;
+        const H = scope.height;
+
+        processor.onaudioprocess = e => {
+          const samples = e.inputBuffer.getChannelData(0);
+          const energyMark = goertzelMark.run(samples);
+          const energySpace = goertzelSpace.run(samples);
+          const bit = energyMark > energySpace ? 1 : 0;
+
+          bitTimer++;
+          if (bitTimer >= (samplesPerBit / 1024)) {
+            bitTimer = 0;
+            bitBuffer.push(bit);
+            if (bitBuffer.length === 8) {
+              decodeBaudot(bitBuffer);
+              bitBuffer = [];
+            }
+          }
+
+          // Draw waveform
+          ctx.clearRect(0, 0, W, H);
+          ctx.beginPath();
+          ctx.strokeStyle = 'lime';
+          for (let i = 0; i < W; i++) {
+            const idx = Math.floor(i * samples.length / W);
+            const y = (0.5 - samples[idx] / 2) * H;
+            ctx.lineTo(i, y);
+          }
+          ctx.stroke();
+        };
+
+        source.connect(processor);
+        processor.connect(audioCtx.destination);
+      });
+    }
+
+    class Goertzel {
+      constructor(freq, sampleRate) {
+        this.N = 1024;
+        this.k = Math.round(0.5 + ((this.N * freq) / sampleRate));
+        this.omega = (2 * Math.PI * this.k) / this.N;
+        this.coeff = 2 * Math.cos(this.omega);
+      }
+      run(samples) {
+        let s_prev = 0, s_prev2 = 0;
+        for (let i = 0; i < samples.length; i++) {
+          let s = samples[i] + this.coeff * s_prev - s_prev2;
+          s_prev2 = s_prev;
+          s_prev = s;
+        }
+        return s_prev2 ** 2 + s_prev ** 2 - this.coeff * s_prev * s_prev2;
+      }
+    }
+  </script>
+</body>
+</html>
