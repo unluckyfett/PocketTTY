@@ -43,6 +43,7 @@ let source = null;
 let receiving = false;
 let ledTimeout = null;
 let txCtx = null;
+const MIN_ENERGY_THRESHOLD = 1e6;
 
 function toggleReceive() {
   if (!receiving) {
@@ -68,12 +69,12 @@ function startReceive() {
   navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     source = audioCtx.createMediaStreamSource(stream);
-    processor = audioCtx.createScriptProcessor(1024, 1, 1);
+    processor = audioCtx.createScriptProcessor(512, 1, 1);
     const goertzelMark = new Goertzel(markFreq, sampleRate);
     const goertzelSpace = new Goertzel(spaceFreq, sampleRate);
 
     let bitBuffer = [];
-    let bitTimer = 0;
+    let samplesCollected = 0;
 
     const canvas = document.getElementById('micScope');
     const ctx = canvas.getContext('2d');
@@ -87,9 +88,15 @@ function startReceive() {
       const samples = e.inputBuffer.getChannelData(0);
       const energyMark = goertzelMark.run(samples);
       const energySpace = goertzelSpace.run(samples);
+      const signalPower = Math.max(energyMark, energySpace);
 
-      let markActive = energyMark > energySpace * thresholdRatio;
-      let spaceActive = energySpace > energyMark * thresholdRatio;
+      let markActive = false;
+      let spaceActive = false;
+
+      if (signalPower > MIN_ENERGY_THRESHOLD) {
+        markActive = energyMark > energySpace * thresholdRatio;
+        spaceActive = energySpace > energyMark * thresholdRatio;
+      }
 
       ledMark.style.background = markActive ? 'lime' : '#333';
       ledSpace.style.background = spaceActive ? 'red' : '#333';
@@ -105,12 +112,15 @@ function startReceive() {
       else if (spaceActive) bit = 0;
 
       if (bit !== null) {
-        bitTimer++;
-        if (bitTimer >= (samplesPerBit / 1024)) {
-          bitTimer = 0;
+        samplesCollected += samples.length;
+        if (samplesCollected >= samplesPerBit) {
+          samplesCollected = 0;
           bitBuffer.push(bit);
+
           if (bitBuffer.length === 8) {
-            decodeBaudot(bitBuffer);
+            if (bitBuffer[0] === 0 && bitBuffer[6] === 1 && bitBuffer[7] === 1) {
+              decodeBaudot(bitBuffer);
+            }
             bitBuffer = [];
           }
         }
@@ -144,128 +154,19 @@ function stopReceive() {
   if (ledTimeout) clearTimeout(ledTimeout);
 }
 
-function startTransmit() {
-  const markFreq = parseFloat(document.getElementById('markFreqInput').value);
-  const spaceFreq = parseFloat(document.getElementById('spaceFreqInput').value);
-  const baud = parseFloat(document.getElementById('baudRateInput').value);
-  const text = document.getElementById('txText').value.toUpperCase();
-
-  const LETTERS = {
-    '': 0, 'E': 1, '
-': 2, 'A': 3, ' ': 4, 'S': 5, 'I': 6, 'U': 7,
-    '
-': 8, 'D': 9, 'R': 10, 'J': 11, 'N': 12, 'F': 13, 'C': 14, 'K': 15,
-    'T': 16, 'Z': 17, 'L': 18, 'W': 19, 'H': 20, 'Y': 21, 'P': 22, 'Q': 23,
-    'O': 24, 'B': 25, 'G': 26, 'M': 28, 'X': 29, 'V': 30
-  };
-
-  const FIGURES = {
-    '': 0, '3': 1, '
-': 2, '-': 3, ' ': 4, '\'': 5, '8': 6, '7': 7,
-    '
-': 8, '$': 9, '4': 10, ',': 12, '!': 13, ':': 14, '(': 15,
-    '5': 16, '"': 17, ')': 18, '2': 19, '#': 20, '6': 21, '0': 22, '1': 23,
-    '9': 24, '?': 25, '&': 26, '.': 28, '/': 29, ';': 30
-  };
-
-  const LTRS = 0x1F; // 11111
-  const FIGS = 0x1B; // 11011
-  let shift = 'LTRS';
-  const bits = [];
-
-  for (let ch of text) {
-    let code;
-    let targetShift = null;
-    if (LETTERS.hasOwnProperty(ch)) {
-      code = LETTERS[ch];
-      targetShift = 'LTRS';
-    } else if (FIGURES.hasOwnProperty(ch)) {
-      code = FIGURES[ch];
-      targetShift = 'FIGS';
-    } else {
-      continue; // skip unsupported
-    }
-
-    if (targetShift !== shift) {
-      shift = targetShift;
-      const shiftCode = (shift === 'LTRS') ? LTRS : FIGS;
-      bits.push(0);
-      for (let i = 0; i < 5; i++) bits.push((shiftCode >> i) & 1);
-      bits.push(1, 1);
-    }
-
-    bits.push(0);
-    for (let i = 0; i < 5; i++) bits.push((code >> i) & 1);
-    bits.push(1, 1);
-  }
-
-  if (!txCtx) txCtx = new (window.AudioContext || window.webkitAudioContext)();
-  const oscillator = txCtx.createOscillator();
-  const gain = txCtx.createGain();
-  oscillator.connect(gain);
-  gain.connect(txCtx.destination);
-
-  let t = txCtx.currentTime;
-  const dt = 1 / baud;
-  for (let b of bits) {
-    oscillator.frequency.setValueAtTime(b ? markFreq : spaceFreq, t);
-    t += dt;
-  }
-  oscillator.start();
-  oscillator.stop(t);
-}
-
-  let t = txCtx.currentTime;
-  const dt = 1 / baud;
-  for (let b of bits) {
-    oscillator.frequency.setValueAtTime(b ? markFreq : spaceFreq, t);
-    t += dt;
-  }
-  oscillator.start();
-  oscillator.stop(t);
-}
-
-class Goertzel {
-  constructor(freq, sampleRate) {
-    this.N = 1024;
-    this.k = Math.round(0.5 + ((this.N * freq) / sampleRate));
-    this.omega = (2 * Math.PI * this.k) / this.N;
-    this.coeff = 2 * Math.cos(this.omega);
-    this.s_prev = 0;
-    this.s_prev2 = 0;
-  }
-  run(samples) {
-    this.s_prev = this.s_prev2 = 0;
-    for (let i = 0; i < samples.length; i++) {
-      let s = samples[i] + this.coeff * this.s_prev - this.s_prev2;
-      this.s_prev2 = this.s_prev;
-      this.s_prev = s;
-    }
-    return this.s_prev2 ** 2 + this.s_prev ** 2 - this.coeff * this.s_prev * this.s_prev2;
-  }
-}
-
 function decodeBaudot(bits) {
-  const LETTERS = [
-    '', 'E', '
-', 'A', ' ', 'S', 'I', 'U',
-    '
-', 'D', 'R', 'J', 'N', 'F', 'C', 'K',
+  const LETTERS = [ '', 'E', '\n', 'A', ' ', 'S', 'I', 'U',
+    '\r', 'D', 'R', 'J', 'N', 'F', 'C', 'K',
     'T', 'Z', 'L', 'W', 'H', 'Y', 'P', 'Q',
-    'O', 'B', 'G', '', 'M', 'X', 'V'
-  ];
+    'O', 'B', 'G', '', 'M', 'X', 'V' ];
 
-  const FIGURES = [
-    '', '3', '
-', '-', ' ', '\'', '8', '7',
-    '
-', '$', '4', '\'', ',', '!', ':', '(',
+  const FIGURES = [ '', '3', '\n', '-', ' ', '\'', '8', '7',
+    '\r', '$', '4', '\'', ',', '!', ':', '(',
     '5', '"', ')', '2', '#', '6', '0', '1',
-    '9', '?', '&', '', '.', '/', ';'
-  ];
+    '9', '?', '&', '', '.', '/', ';' ];
 
-  const LTRS = 0x1F;  // 11111
-  const FIGS = 0x1B;  // 11011
+  const LTRS = 0x1F;
+  const FIGS = 0x1B;
 
   const value = bits.slice(1, 6).reduce((acc, b, i) => acc | (b << i), 0);
 
@@ -282,6 +183,26 @@ function decodeBaudot(bits) {
   const table = decodeBaudot.shift === 'FIGS' ? FIGURES : LETTERS;
   let char = table[value] || '?';
   document.getElementById("rxOutput").textContent += char;
+}
+
+class Goertzel {
+  constructor(freq, sampleRate) {
+    this.N = 512;
+    this.k = Math.round(0.5 + ((this.N * freq) / sampleRate));
+    this.omega = (2 * Math.PI * this.k) / this.N;
+    this.coeff = 2 * Math.cos(this.omega);
+    this.s_prev = 0;
+    this.s_prev2 = 0;
+  }
+  run(samples) {
+    this.s_prev = this.s_prev2 = 0;
+    for (let i = 0; i < samples.length; i++) {
+      let s = samples[i] + this.coeff * this.s_prev - this.s_prev2;
+      this.s_prev2 = this.s_prev;
+      this.s_prev = s;
+    }
+    return this.s_prev2 ** 2 + this.s_prev ** 2 - this.coeff * this.s_prev * this.s_prev2;
+  }
 }
 </script>
 </body>
